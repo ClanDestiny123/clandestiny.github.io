@@ -1,2 +1,2 @@
 # clandestiny.github.io
-Where I test stuff or something
+This is where I test out QuietBoard, my vibecoded textboard software.
