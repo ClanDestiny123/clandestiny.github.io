@@ -33,6 +33,16 @@ try {
     exit;
 }
 
+// The global lock is stored in MySQL so it survives sessions and server restarts.
+// If the v3 migration has not run yet, fail open for reading; the upgrade instructions
+// require running upgrade.php before enabling the lock.
+$globalLocked = false;
+try {
+    $globalLocked = $pdo->query("SELECT setting_value FROM board_settings WHERE setting_key = 'global_lock' LIMIT 1")->fetchColumn() === '1';
+} catch (Throwable $e) {
+    $globalLocked = false;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     check_csrf();
     $action = (string)($_POST['action'] ?? '');
@@ -53,6 +63,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'logout') { unset($_SESSION['admin_id'], $_SESSION['admin_name']); session_regenerate_id(true); redirect_board(); }
 
     if ($action === 'post') {
+        // Enforce read-only mode on the server; hiding forms alone is not sufficient.
+        if ($globalLocked && !is_admin()) {
+            $_SESSION['flash'] = 'The board is temporarily locked. Posting is disabled.';
+            redirect_board();
+        }
         $body = trim((string)($_POST['body'] ?? ''));
         $threadId = (int)($_POST['thread_id'] ?? 0);
         $sage = isset($_POST['sage']) ? 1 : 0;
@@ -62,11 +77,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $ip = client_ip();
         $ban = $pdo->prepare('SELECT id FROM bans WHERE ip_address = ? LIMIT 1');
         $ban->execute([$ip]);
-        if ($ban->fetch()) { http_response_code(403); exit('Posting is disabled for this IP address.'); }
+        if ($ban->fetch() && !is_admin()) { http_response_code(403); exit('Posting is disabled for this IP address.'); }
 
         if ($threadId > 0) {
-            $q = $pdo->prepare('SELECT id, sticky FROM threads WHERE id = ?'); $q->execute([$threadId]); $thread = $q->fetch();
+            $q = $pdo->prepare('SELECT id, sticky, locked FROM threads WHERE id = ?'); $q->execute([$threadId]); $thread = $q->fetch();
             if (!$thread) { $_SESSION['flash'] = 'That thread no longer exists.'; redirect_board(); }
+            if ((int)$thread['locked'] && !is_admin()) { $_SESSION['flash'] = 'This thread is locked; replies are disabled for visitors.'; redirect_board(); }
             $stmt = $pdo->prepare('INSERT INTO posts (thread_id, name, body, ip_address, created_at) VALUES (?, ?, ?, ?, NOW())');
             $stmt->execute([$threadId, is_admin() ? (string)($_SESSION['admin_name'] ?? 'Admin') : 'Anonymous', $body, $ip]);
             if (!$sage && !(int)$thread['sticky']) $pdo->prepare('UPDATE threads SET bumped_at = NOW() WHERE id = ?')->execute([$threadId]);
@@ -99,6 +115,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'edit_post') {
         $id = (int)($_POST['post_id'] ?? 0); $body = trim((string)($_POST['body'] ?? ''));
         if ($body !== '' && mb_strlen($body) <= 4000) $pdo->prepare('UPDATE posts SET body = ? WHERE id = ?')->execute([$body, $id]);
+        redirect_board();
+    }
+    if ($action === 'lock_thread') {
+        $id = (int)($_POST['thread_id'] ?? 0);
+        $locked = (isset($_POST['locked']) && (string)$_POST['locked'] === '1') ? 1 : 0;
+        $pdo->prepare('UPDATE threads SET locked = ? WHERE id = ?')->execute([$locked, $id]);
         redirect_board();
     }
     if ($action === 'sticky') {
@@ -142,18 +164,21 @@ $bans = is_admin() ? $pdo->query('SELECT id, ip_address, reason, created_at FROM
 <title><?= h(BOARD_TITLE) ?></title>
 <style>
 :root{color-scheme:dark;--bg:#111318;--panel:#1b1e25;--line:#343944;--text:#e6e8ed;--muted:#969daa;--link:#9dbcfb;--red:#ff6868}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}header,main{max-width:960px;margin:auto;padding:18px}header{border-bottom:1px solid var(--line)}h1{margin:0;font-size:1.7rem}a{color:var(--link)}.muted{color:var(--muted)}.panel,.thread{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;margin:14px 0}.thread.sticky{border-color:#b18a43}.post{padding:10px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.post:last-child{border:0}.meta{font-size:.85rem;color:var(--muted)}.name{color:#9da3ad;font-weight:650}.admin-name{color:var(--red);font-weight:800}.postid{color:#8ab4ff}.body{white-space:pre-wrap;margin-top:5px}.subject{font-weight:750}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,textarea,button{font:inherit;background:#101217;color:var(--text);border:1px solid #454b58;border-radius:5px;padding:9px}input,textarea{width:100%}textarea{min-height:95px;resize:vertical}button{cursor:pointer;background:#292e39}button:hover{background:#373e4b}.smallform{display:inline-flex;gap:5px;align-items:center;margin:3px 4px 3px 0}.smallform input{width:auto}.flash{padding:10px;border:1px solid #7a5a2a;border-radius:5px}.admin-tools{margin-top:7px;font-size:.85rem}.admin-tools details{display:inline-block}.compose-grid{display:grid;grid-template-columns:1fr 2fr;gap:10px}@media(max-width:600px){.compose-grid{grid-template-columns:1fr}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}header,main{max-width:960px;margin:auto;padding:18px}header{border-bottom:1px solid var(--line)}h1{margin:0;font-size:1.7rem}a{color:var(--link)}.muted{color:var(--muted)}.panel,.thread{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;margin:14px 0}.thread.sticky{border-color:#b18a43}.post{padding:10px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.post:last-child{border:0}.meta{font-size:.85rem;color:var(--muted)}.name{color:#9da3ad;font-weight:650}.admin-name{color:var(--red);font-weight:800}.postid{color:#8ab4ff}.body{white-space:pre-wrap;margin-top:5px}.subject{font-weight:750}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,textarea,button{font:inherit;background:#101217;color:var(--text);border:1px solid #454b58;border-radius:5px;padding:9px}input,textarea{width:100%}textarea{min-height:95px;resize:vertical}button{cursor:pointer;background:#292e39}button:hover{background:#373e4b}.smallform{display:inline-flex;gap:5px;align-items:center;margin:3px 4px 3px 0}.smallform input{width:auto}.flash{padding:10px;border:1px solid #7a5a2a;border-radius:5px}.board-lock-notice{margin:16px 0;padding:14px;border:1px solid #bd4545;border-left:5px solid #ff6868;border-radius:7px;background:#351b20;color:#ffe3e3}.board-lock-notice strong{display:block;font-size:1.05rem;letter-spacing:.04em}.board-lock-notice small{display:block;margin-top:5px;color:#ffc1c1}.admin-tools{margin-top:7px;font-size:.85rem}.admin-tools details{display:inline-block}.compose-grid{display:grid;grid-template-columns:1fr 2fr;gap:10px}@media(max-width:600px){.compose-grid{grid-template-columns:1fr}}
 </style></head><body>
 <header><div class="row" style="justify-content:space-between"><div><h1><?= h(BOARD_TITLE) ?></h1><div class="muted">One page · latest 30 regular threads · sage does not bump</div></div>
 <?php if (is_admin()): ?><form method="post"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="logout"><button>Log out (<?= h((string)($_SESSION['admin_name'] ?? 'Admin')) ?>)</button></form><?php else: ?><a href="#admin">Admin login</a><?php endif; ?></div></header>
 <main>
+<?php if ($globalLocked): ?><section class="board-lock-notice"><strong>BOARD TEMPORARILY LOCKED</strong><div>Posting is disabled for visitors. Existing threads and posts remain available to read.</div><?php if (is_admin()): ?><small>You are an administrator; posting and moderation remain available.</small><?php endif; ?></section><?php endif; ?>
 <?php if ($flash): ?><p class="flash"><?= h((string)$flash) ?></p><?php endif; ?>
+<?php if (!$globalLocked || is_admin()): ?>
 <section class="panel"><h2 style="margin-top:0">Start a thread</h2><form method="post"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="post">
 <div class="compose-grid"><div><label>Subject (optional)<input name="subject" maxlength="120" placeholder="Thread subject"></label></div><div><label>Message<textarea name="body" required maxlength="4000" placeholder="Write your post…"></textarea></label></div></div>
 <p class="muted">Posting as <strong class="<?= is_admin() ? 'admin-name' : 'name' ?>"><?= h(is_admin() ? (string)($_SESSION['admin_name'] ?? 'Admin') : 'Anonymous') ?></strong></p><button type="submit">Post thread</button></form></section>
+<?php else: ?><section class="panel muted">New threads and replies are temporarily disabled while the board is locked.</section><?php endif; ?>
 <?php foreach ($threads as $thread): $postsStmt->execute([$thread['id']]); $posts = $postsStmt->fetchAll(); ?>
 <article class="thread <?= (int)$thread['sticky'] ? 'sticky' : '' ?>" id="thread-<?= (int)$thread['id'] ?>">
-<div class="subject"><?= (int)$thread['sticky'] ? '📌 ' : '' ?><?= h((string)$thread['subject']) ?> <span class="meta">/ thread #<?= (int)$thread['id'] ?></span></div>
+<div class="subject"><?= (int)$thread['sticky'] ? '📌 ' : '' ?><?= (int)$thread['locked'] ? '🔒 ' : '' ?><?= h((string)$thread['subject']) ?> <span class="meta">/ thread #<?= (int)$thread['id'] ?></span></div>
 <?php foreach ($posts as $post): ?>
 <div class="post"><div class="meta"><span class="<?= $post['name'] === 'Anonymous' ? 'name' : 'admin-name' ?>"><?= h((string)$post['name']) ?></span> <span class="postid">No.<?= (int)$post['id'] ?></span> · <?= h((string)$post['created_at']) ?></div>
 <div class="body" id="body-<?= (int)$post['id'] ?>"><?= h((string)$post['body']) ?></div>
@@ -163,13 +188,14 @@ $bans = is_admin() ? $pdo->query('SELECT id, ip_address, reason, created_at FROM
 <form class="smallform" method="post" onsubmit="return confirm('Ban this poster IP? Shared IPs may affect other people.')"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="ban"><input type="hidden" name="post_id" value="<?= (int)$post['id'] ?>"><input name="reason" placeholder="Ban reason" aria-label="Ban reason"><button>Ban IP</button></form>
 </div><?php endif; ?></div>
 <?php endforeach; ?>
-<div class="row"><form method="post" style="flex:1;min-width:240px"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="post"><input type="hidden" name="thread_id" value="<?= (int)$thread['id'] ?>"><textarea name="body" required maxlength="4000" placeholder="Reply to thread #<?= (int)$thread['id'] ?>" style="min-height:65px"></textarea><div class="row"><label><input type="checkbox" name="sage" value="1" style="width:auto"> Sage (don't bump)</label><button>Reply</button></div></form>
-<?php if (is_admin()): ?><form method="post"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="sticky"><input type="hidden" name="thread_id" value="<?= (int)$thread['id'] ?>"><input type="hidden" name="sticky" value="<?= (int)!$thread['sticky'] ?>"><button><?= (int)$thread['sticky'] ? 'Unsticky' : 'Sticky' ?></button></form><?php endif; ?></div>
+<div class="row"><?php if ((!(int)$thread['locked'] || is_admin()) && (!$globalLocked || is_admin())): ?><form method="post" style="flex:1;min-width:240px"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="post"><input type="hidden" name="thread_id" value="<?= (int)$thread['id'] ?>"><textarea name="body" required maxlength="4000" placeholder="Reply to thread #<?= (int)$thread['id'] ?>" style="min-height:65px"></textarea><div class="row"><label><input type="checkbox" name="sage" value="1" style="width:auto"> Sage (don't bump)</label><button>Reply</button></div></form><?php else: ?><span class="muted"><?= (int)$thread['locked'] && !is_admin() ? 'This thread is locked.' : 'Board is read-only.' ?></span><?php endif; ?>
+<?php if (is_admin()): ?><form method="post"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="lock_thread"><input type="hidden" name="thread_id" value="<?= (int)$thread['id'] ?>"><input type="hidden" name="locked" value="<?= (int)!$thread['locked'] ?>"><button><?= (int)$thread['locked'] ? 'Unlock thread' : 'Lock thread' ?></button></form><form method="post"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="sticky"><input type="hidden" name="thread_id" value="<?= (int)$thread['id'] ?>"><input type="hidden" name="sticky" value="<?= (int)!$thread['sticky'] ?>"><button><?= (int)$thread['sticky'] ? 'Unsticky' : 'Sticky' ?></button></form><?php endif; ?></div>
 </article>
 <?php endforeach; ?>
 <?php if (!$threads): ?><p class="muted">No threads yet. Start one above.</p><?php endif; ?>
 <?php if (!is_admin()): ?><section class="panel" id="admin"><h2 style="margin-top:0">Admin login</h2><form method="post"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="login"><p><label>Username<input name="username" required autocomplete="username"></label></p><p><label>Password<input type="password" name="password" required autocomplete="current-password"></label></p><button>Log in</button></form></section>
-<?php else: ?><section class="panel"><h2 style="margin-top:0">Admin settings</h2><form method="post" class="row"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="change_admin_name"><label style="flex:1">Admin username / display name<input name="admin_name" maxlength="40" required value="<?= h((string)($_SESSION['admin_name'] ?? 'Admin')) ?>"></label><button>Change name</button></form>
-<h3>IP bans</h3><?php if (!$bans): ?><p class="muted">No IP bans.</p><?php else: foreach ($bans as $ban): ?><div class="row"><span><?= h((string)$ban['ip_address']) ?> — <?= h((string)$ban['reason']) ?></span><form method="post"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="unban"><input type="hidden" name="ban_id" value="<?= (int)$ban['id'] ?>"><button>Unban</button></form></div><?php endforeach; endif; ?></section><?php endif; ?>
+<?php else: ?><section class="panel"><h2 style="margin-top:0">Administration</h2>
+<p><a href="admin.php">Open admin dashboard: board lock, accounts, password, and IP bans →</a></p>
+<form method="post" class="row"><input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="change_admin_name"><label style="flex:1">Admin username / display name<input name="admin_name" maxlength="40" required value="<?= h((string)($_SESSION['admin_name'] ?? 'Admin')) ?>"></label><button>Change name</button></form></section><?php endif; ?>
 <footer class="muted" style="padding:20px 0;text-align:center">QuietBoard · Keep it civil.</footer>
 </main></body></html>
